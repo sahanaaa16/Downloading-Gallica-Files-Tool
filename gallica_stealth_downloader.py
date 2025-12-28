@@ -62,6 +62,12 @@ def download_gallica_pdf(driver, url, ark_id, download_folder):
     Navigate to Gallica and download PDF.
     """
     try:
+        # Check if file already exists
+        existing_files = list(Path(download_folder).glob(f"*{ark_id}.pdf"))
+        if existing_files:
+            print(f"  ⊙ Already downloaded: {ark_id}")
+            return True, "Already exists"
+        
         print(f"  Opening: {url}")
         driver.get(url)
         
@@ -73,9 +79,87 @@ def download_gallica_pdf(driver, url, ark_id, download_folder):
         print(f"  Trying PDF URL: {pdf_url}")
         
         driver.get(pdf_url)
-        wait_random(10, 15)  # Wait for download to complete
         
-        return True, "Download initiated"
+        # Wait a moment for the page to load
+        time.sleep(3)
+        
+        # Check if we got an error page or authentication requirement
+        try:
+            page_title = driver.title.lower()
+            page_source = driver.page_source.lower()
+            
+            # Check for common error indicators
+            error_indicators = [
+                'erreur', 'error', 'not found', '404', 'access denied',
+                'authentification', 'authentication', 'login', 'connexion',
+                'restricted', 'restreint', 'indisponible', 'unavailable',
+                'payant', 'payment', 'abonnement', 'subscription'
+            ]
+            
+            for indicator in error_indicators:
+                if indicator in page_title or indicator in page_source[:2000]:  # Check first 2000 chars
+                    print(f"  ⚠ Link requires authentication or is restricted")
+                    print(f"  ⚠ SKIPPED: {url}")
+                    return False, "Link not directly downloadable (authentication/payment required)"
+        except:
+            # If we can't check the page, continue anyway
+            pass
+        
+        # Wait for download to actually start
+        print(f"  Waiting for download to start...")
+        download_started = False
+        initial_wait = 15  # Wait up to 15 seconds for download to start
+        start_time = time.time()
+        
+        while time.time() - start_time < initial_wait:
+            # Check if download has started (.crdownload or .pdf file)
+            crdownload_files = list(Path(download_folder).glob(f"*{ark_id}*.crdownload"))
+            pdf_files = list(Path(download_folder).glob(f"*{ark_id}.pdf"))
+            
+            if crdownload_files or pdf_files:
+                download_started = True
+                print(f"  ✓ Download started")
+                break
+            
+            time.sleep(1)
+        
+        if not download_started:
+            print(f"  ⚠ Download did not start - link may not be directly downloadable")
+            print(f"  ⚠ SKIPPED: {url}")
+            return False, "Download did not start (link not directly downloadable)"
+        
+        # Wait for download to actually complete
+        print(f"  Waiting for download to complete...")
+        download_complete = False
+        max_wait = 600  # 10 minutes max per file (for large PDFs)
+        start_time = time.time()
+        
+        while time.time() - start_time < max_wait:
+            # Check if PDF file exists (not .crdownload)
+            existing_files = list(Path(download_folder).glob(f"*{ark_id}.pdf"))
+            if existing_files:
+                # File exists, check if it's still growing
+                file_size = existing_files[0].stat().st_size
+                time.sleep(5)  # Wait longer for large files
+                new_size = existing_files[0].stat().st_size
+                
+                # Double-check that file has stopped growing
+                if new_size == file_size and file_size > 1000:
+                    time.sleep(5)  # Wait again to be sure
+                    final_size = existing_files[0].stat().st_size
+                    
+                    if final_size == new_size:  # File truly stopped growing
+                        download_complete = True
+                        file_size_mb = file_size / (1024 * 1024)
+                        print(f"  ✓ Download complete ({file_size_mb:.1f} MB)")
+                        break
+            
+            time.sleep(3)
+        
+        if not download_complete:
+            return False, "Download timeout or failed"
+        
+        return True, "Download complete"
         
     except Exception as e:
         return False, f"Error: {str(e)}"
@@ -139,14 +223,37 @@ def download_from_csv(csv_file, download_folder='gallica_downloads'):
             ark_id = extract_ark_id(url)
             print(f"[{i}/{total}] {ark_id}")
             
-            success, message = download_gallica_pdf(driver, url, ark_id, download_folder)
+            # Restart browser every 10 downloads to prevent crashes
+            if i > 1 and (i - 1) % 10 == 0:
+                print("  ⟳ Restarting browser to prevent memory issues...")
+                try:
+                    driver.quit()
+                    time.sleep(3)
+                except:
+                    pass
+                driver = setup_driver(download_folder)
+                print("  ✓ Browser restarted\n")
             
-            if success:
-                successful += 1
-                print(f"  ✓ {message}")
-            else:
+            try:
+                success, message = download_gallica_pdf(driver, url, ark_id, download_folder)
+                
+                if success:
+                    successful += 1
+                    print(f"  ✓ {message}")
+                else:
+                    failed += 1
+                    print(f"  ✗ {message}")
+            except Exception as e:
                 failed += 1
-                print(f"  ✗ {message}")
+                print(f"  ✗ Error: {str(e)}")
+                # Try to restart browser on error
+                try:
+                    driver.quit()
+                    time.sleep(3)
+                except:
+                    pass
+                driver = setup_driver(download_folder)
+                print("  ⟳ Browser restarted after error")
             
             # Random delay between downloads
             if i < total:
@@ -181,7 +288,7 @@ def download_from_csv(csv_file, download_folder='gallica_downloads'):
 if __name__ == "__main__":
     import sys
     
-    csv_file = "sahana_spreadsheet_fixed.csv"
+    csv_file = "test.csv"
     download_folder = "gallica_downloads"
     
     if len(sys.argv) > 1:
